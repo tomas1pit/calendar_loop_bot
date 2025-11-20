@@ -303,6 +303,63 @@ def clear_last_detail_post(mattermost_user_id):
         )
         conn.commit()
 
+def format_alarms_block(start: datetime | None, alarms: list[datetime]) -> list[str]:
+    """
+    Возвращает список строк для блока "Напоминания".
+    """
+    if not alarms:
+        return ["Напоминания: —"]
+
+    tz_local = tz.gettz(TZ_NAME)
+    lines = ["Напоминания:"]
+
+    # сортируем
+    alarms_sorted = sorted(alarms)
+    for alarm_dt in alarms_sorted:
+        if alarm_dt is None:
+            continue
+
+        if alarm_dt.tzinfo is None:
+            alarm_dt = alarm_dt.replace(tzinfo=tz_local)
+        else:
+            alarm_dt = alarm_dt.astimezone(tz_local)
+
+        if isinstance(start, datetime):
+            if start.tzinfo is None:
+                start_local = start.replace(tzinfo=tz_local)
+            else:
+                start_local = start.astimezone(tz_local)
+
+            diff = start_local - alarm_dt
+            minutes = int(round(diff.total_seconds() / 60))
+
+            if abs(diff.total_seconds()) < 60:
+                human = "в момент начала"
+            elif minutes > 0:
+                # напоминание ДО начала
+                if minutes < 60:
+                    human = f"за {minutes} мин до начала"
+                elif minutes < 24 * 60:
+                    h = minutes // 60
+                    m = minutes % 60
+                    if m:
+                        human = f"за {h} ч {m} мин до начала"
+                    else:
+                        human = f"за {h} ч до начала"
+                else:
+                    d = minutes // (24 * 60)
+                    human = f"за {d} дн. до начала"
+            else:
+                # экзотика — напоминание ПОСЛЕ начала
+                human = f"{alarm_dt.strftime('%d.%m.%Y %H:%M')} (после начала)"
+
+            lines.append(f"- {human}")
+        else:
+            # если нет start — просто выводим время
+            lines.append(f"- {alarm_dt.strftime('%d.%m.%Y %H:%M')}")
+
+    return lines
+
 def alarm_already_sent(mattermost_user_id, event_uid, alarm_dt):
     with db_conn() as conn:
         c = conn.cursor()
@@ -979,6 +1036,40 @@ def get_events_for_tracking(email, password):
                 }
             )
 
+        # 🔹 НОВОЕ: вытаскиваем VALARM
+        alarms = []
+        for alarm in vevent.contents.get("valarm", []):
+            trig = getattr(alarm, "trigger", None)
+            if not trig:
+                continue
+            trig_val = trig.value
+            alarm_dt = None
+
+            if isinstance(trig_val, datetime):
+                if trig_val.tzinfo is None:
+                    alarm_dt = trig_val.replace(tzinfo=tz_local)
+                else:
+                    alarm_dt = trig_val.astimezone(tz_local)
+            elif isinstance(trig_val, timedelta):
+                alarm_dt = dtstart + trig_val
+            elif isinstance(trig_val, str):
+                m = re.match(r"-PT(\d+)M", trig_val)
+                if m:
+                    minutes = int(m.group(1))
+                    alarm_dt = dtstart - timedelta(minutes=minutes)
+                else:
+                    m = re.match(r"-PT(\d+)H", trig_val)
+                    if m:
+                        hours = int(m.group(1))
+                        alarm_dt = dtstart - timedelta(hours=hours)
+
+            if alarm_dt:
+                if alarm_dt.tzinfo is None:
+                    alarm_dt = alarm_dt.replace(tzinfo=tz_local)
+                else:
+                    alarm_dt = alarm_dt.astimezone(tz_local)
+                alarms.append(alarm_dt)
+
         if not isinstance(dtstart, datetime):
             continue
         if dtstart.tzinfo is None:
@@ -996,6 +1087,7 @@ def get_events_for_tracking(email, password):
                 "url": url,
                 "attendees": attendees,
                 "status": status,
+                "alarms": alarms,
             }
         )
 
@@ -1372,6 +1464,7 @@ def format_events_summary_with_select(events, title="Встречи на сег�
 
         attendees = ev.get("attendees") or []
         url = ev.get("url") or ""
+        alarms = ev.get("alarms") or []
 
         events_ctx.append(
             {
@@ -1380,6 +1473,10 @@ def format_events_summary_with_select(events, title="Встречи на сег�
                 "attendees": attendees,
                 "description": description,
                 "url": url,
+                "start": start.isoformat() if isinstance(start, datetime) else "",
+                "alarms": [
+                    a.isoformat() for a in alarms if isinstance(a, datetime)
+                ],
             }
         )
 
@@ -1558,6 +1655,12 @@ def format_event_details(title, when_human, attendees, description, url, header_
     else:
         lines.append("\nГде: —")
 
+    # 🔹 НОВОЕ: блок напоминаний
+    alarms = alarms or []
+    alarm_lines = format_alarms_block(start, alarms)
+    lines.append("")  # пустая строка перед блоком
+    lines.extend(alarm_lines)
+
     return "\n".join(lines)
 
 def handle_show_event_details_select(user_id, payload):
@@ -1588,8 +1691,24 @@ def handle_show_event_details_select(user_id, payload):
     attendees = ev.get("attendees") or []
     description = ev.get("description") or ""
     url = ev.get("url") or ""
+    start_iso = ev.get("start") or ""
+    alarms_iso = ev.get("alarms") or []
+    
+    start_dt = None
+    if start_iso:
+        try:
+            start_dt = datetime.fromisoformat(start_iso)
+        except Exception:
+            start_dt = None
 
-    text = format_event_details(title, when_human, attendees, description, url)
+    alarms = []
+    for s in alarms_iso:
+        try:
+            alarms.append(datetime.fromisoformat(s))
+        except Exception:
+            pass
+
+    text = format_event_details(title, when_human, attendees, description, url, start=start_dt, alarms=alarms)
 
     last_post_id = get_last_detail_post(user_id)
 
@@ -1611,8 +1730,10 @@ def handle_show_event_details(user_id, context):
     attendees = context.get("attendees") or []
     description = context.get("description") or ""
     url = context.get("url") or ""
+    start_dt = context.get("start")  # если будешь передавать
+    alarms = context.get("alarms") or []
 
-    text = format_event_details(title, when_human, attendees, description, url)
+    text = format_event_details(title, when_human, attendees, description, url, start=start_dt, alarms=alarms,)
     mm_send_dm(user_id, text)
 
 def handle_event_rsvp(user_id, uid, choice):
@@ -1889,6 +2010,8 @@ def send_new_event_notification(mattermost_user_id, ev):
         description=ev.get("description") or "",
         url=ev.get("url") or "",
         header_prefix="### 🆕 Новая встреча",
+        start=ev.get("start"),
+        alarms=ev.get("alarms") or [],
     )
     props = build_event_rsvp_props(ev["uid"])
     mm_send_dm(mattermost_user_id, text, props=props)
@@ -1915,6 +2038,8 @@ def send_event_rescheduled_notification(mattermost_user_id, old_ev, new_ev):
         attendees=new_ev.get("attendees") or [],
         description=new_ev.get("description") or "",
         url=new_ev.get("url") or "",
+        start=new_ev.get("start"),
+        alarms=new_ev.get("alarms") or [],
     )
     text = "\n".join(lines) + "\n" + details
     props = build_event_rsvp_props(new_ev["uid"])
