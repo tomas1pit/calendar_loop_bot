@@ -9,6 +9,10 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 import uuid
 import re
+import logging
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 import vobject
 import requests
@@ -1638,6 +1642,7 @@ def handle_meeting_draft_step(user_id, channel_id, user, draft, text):
     return False
 
 def handle_new_dm_message(user_id, channel_id, text):
+    logger.info("DM message: user_id=%s channel_id=%s text=%r", user_id, channel_id, text)
     if ENCRYPTION_MISCONFIGURED:
         mm_send_dm(
             user_id,
@@ -1689,6 +1694,7 @@ def handle_new_dm_message(user_id, channel_id, text):
         txt_stripped = text.strip()
         txt_lower = txt_stripped.lower()
         bot_name = (BOT_USERNAME or "").lower()
+        logger.debug("Mention detection: BOT_USERNAME=%r bot_name=%r txt_lower=%r", BOT_USERNAME, bot_name, txt_lower)
 
         if txt_lower.startswith("debug caldav"):
             debug_dump_caldav_events(user_id)
@@ -1720,45 +1726,114 @@ def websocket_loop():
         "http://", "ws://"
     )
     ws_url = ws_url.rstrip("/") + "/api/v4/websocket"
+    logger.info("Starting websocket loop to %s", ws_url)
+
     while True:
         try:
+            logger.info("Connecting to Mattermost websocket...")
             ws = create_connection(
                 ws_url,
                 header=[f"Authorization: Bearer {MATTERMOST_BOT_TOKEN}"],
             )
+            logger.info("Websocket connected")
+
             while True:
-                msg = ws.recv()
+                try:
+                    msg = ws.recv()
+                except WebSocketConnectionClosedException:
+                    logger.warning("Websocket recv() got WebSocketConnectionClosedException")
+                    break
+                except Exception as e:
+                    logger.warning("Error receiving from websocket: %s", e)
+                    break
+
                 if not msg:
                     continue
-                data = json.loads(msg)
-                if data.get("event") != "posted":
+
+                try:
+                    data = json.loads(msg)
+                except Exception as e:
+                    logger.warning("Failed to parse websocket message as JSON: %s", e)
                     continue
+
+                event_type = data.get("event")
+                if event_type != "posted":
+                    continue
+
                 data_payload = data.get("data", {}) or {}
                 post_raw = data_payload.get("post")
                 if not post_raw:
                     continue
+
                 channel_type = data_payload.get("channel_type")
-                post = json.loads(post_raw)
+
+                try:
+                    post = json.loads(post_raw)
+                except Exception as e:
+                    logger.warning("Failed to parse 'post' field JSON: %s", e)
+                    continue
+
                 channel_id = post.get("channel_id")
                 user_id = post.get("user_id")
                 message = post.get("message", "")
-                if post.get("user_id") == BOT_USER_ID:
+
+                logger.debug(
+                    "WS posted event: user_id=%s channel_type=%s channel_id=%s message=%r",
+                    user_id,
+                    channel_type,
+                    channel_id,
+                    message,
+                )
+
+                if user_id == BOT_USER_ID:
+                    logger.debug("Skipping message from bot itself (user_id=%s)", user_id)
                     continue
+
+                is_dm = False
                 if channel_type is not None:
-                    if channel_type != "D":
+                    is_dm = channel_type == "D"
+                    if not is_dm:
+                        logger.debug(
+                            "Skip non-DM message: user_id=%s channel_type=%s channel_id=%s",
+                            user_id,
+                            channel_type,
+                            channel_id,
+                        )
                         continue
                 else:
                     try:
                         channel = mm_get_channel(channel_id)
-                    except Exception:
+                    except Exception as e:
+                        logger.warning("Failed to get channel %s: %s", channel_id, e)
                         continue
-                    if channel.get("type") != "D":
+
+                    is_dm = channel.get("type") == "D"
+                    if not is_dm:
+                        logger.debug(
+                            "Skip non-DM message after channel lookup: user_id=%s channel_id=%s type=%r",
+                            user_id,
+                            channel_id,
+                            channel.get("type"),
+                        )
                         continue
-                handle_new_dm_message(user_id, channel_id, message)
+
+                logger.info(
+                    "Incoming DM to bot from user_id=%s in channel_id=%s message=%r",
+                    user_id,
+                    channel_id,
+                    message,
+                )
+                try:
+                    handle_new_dm_message(user_id, channel_id, message)
+                except Exception as e:
+                    logger.exception("Error in handle_new_dm_message: %s", e)
+
         except WebSocketConnectionClosedException:
+            logger.warning("Websocket connection closed, reconnecting in 3 seconds...")
             time.sleep(3)
             continue
-        except Exception:
+        except Exception as e:
+            logger.exception("Unexpected error in websocket_loop: %s", e)
             time.sleep(5)
             continue
 
@@ -1781,6 +1856,7 @@ def job_daily_summary():
 @app.route("/mattermost/actions", methods=["POST"])
 def mattermost_actions():
     payload = request.json
+    logger.info("Webhook /mattermost/actions called with payload=%s", payload)
     user_id = payload.get("user_id")
     context = payload.get("context", {}) or {}
     action = context.get("action")
@@ -1857,6 +1933,7 @@ def main():
     init_db()
     check_encryption_misconfiguration()
     init_bot_identity()
+    logger.info("Bot started with BOT_USER_ID=%s BOT_USERNAME=%s", BOT_USER_ID, BOT_USERNAME)
     scheduler.add_job(job_daily_summary, "cron", hour=14, minute=0)
     scheduler.add_job(job_events_sync, "interval", minutes=1)  # TO_BE_UPDATED
     scheduler.add_job(cleanup_old_snapshots, "cron", hour=0, minute=0)
@@ -1864,7 +1941,6 @@ def main():
     t = threading.Thread(target=websocket_loop, daemon=True)
     t.start()
     port = int(os.getenv("PORT", "8000"))
+    logger.info("Starting Flask app on port %s", port)
     app.run(host="0.0.0.0", port=port)
 
-if __name__ == "__main__":
-    main()
