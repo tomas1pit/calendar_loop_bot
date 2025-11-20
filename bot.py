@@ -312,7 +312,7 @@ def get_primary_calendar(email, password):
     if not calendars:
         raise RuntimeError("No calendars found for user")
 
-    preferred_names = ["Main", "Из почты"]
+    preferred_names = ["Main", "Основной"]
     selected = None
     for c in calendars:
         name = getattr(c, "name", None)
