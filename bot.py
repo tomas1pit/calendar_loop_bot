@@ -2415,7 +2415,7 @@ def main():
 
     scheduler.add_job(job_daily_summary, "cron", hour=14, minute=0)
     scheduler.add_job(job_event_alarms, "interval", minutes=1)
-    scheduler.add_job(job_event_changes, "interval", minutes=5)
+    scheduler.add_job(job_event_changes, "interval", minutes=1)
     scheduler.start()
 
     t = threading.Thread(target=websocket_loop, daemon=True)
