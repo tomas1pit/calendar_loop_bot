@@ -1185,14 +1185,18 @@ def format_event_details(title, when_human, attendees, description, url, header_
     else:
         lines.append("\nОписание: —")
 
-    url = (url or "").strip()
-    if url:
-        lines.append("\nURL:")
-        lines.append(url)
-    else:
-        lines.append("\nURL: —")
+    # Поле "Где" — может содержать URL, адрес или любой текст
+    location = (url or "").strip()  # url используется как поле location
 
-    return "\n".join(lines)
+    if location:
+        lines.append("\nГде:")
+        # Разбиваем по переносам, чтобы поддержать многострочные локации
+        for part in location.splitlines():
+            lines.append(part)
+    else:
+        lines.append("\nГде: —")
+
+        return "\n".join(lines)
 
 def handle_show_event_details_select(user_id, payload):
     context = payload.get("context", {}) or {}
@@ -1919,7 +1923,7 @@ def main():
     check_encryption_misconfiguration()
     init_bot_identity()
 
-    scheduler.add_job(job_daily_summary, "cron", hour=9, minute=0)
+    scheduler.add_job(job_daily_summary, "cron", hour=14, minute=0)
     scheduler.add_job(job_event_alarms, "interval", minutes=1)
     scheduler.start()
 
