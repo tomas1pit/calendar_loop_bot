@@ -1494,6 +1494,18 @@ def upsert_tracked_event(mattermost_user_id, ev):
             ),
         )
         conn.commit()
+        
+def delete_tracked_event(mattermost_user_id, uid):
+    """
+    Удаляем событие из трекинга (чтобы не слать уведомления повторно).
+    """
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "DELETE FROM tracked_events WHERE mattermost_user_id = ? AND uid = ?",
+            (mattermost_user_id, uid),
+        )
+        conn.commit()
 
 STATUS_EMOJI = {
     "ACCEPTED": "✅",
@@ -2232,44 +2244,68 @@ def job_event_changes():
                 upsert_tracked_event(mm_user_id, ev)
             continue
 
-        for uid, ev in new_map.items():
-            old_ev = old_map.get(uid)
+        # 🔹 Обрабатываем события, которые ПРОПАЛИ из new_map
+        # (Mail.ru мог просто удалить их из выборки без STATUS:CANCELLED).
+        tz_local = tz.gettz(TZ_NAME)
+        now_local = datetime.now(tz_local)
 
-            if not old_ev:
-                # новое событие
-                upsert_tracked_event(mm_user_id, ev)
-                send_new_event_notification(mm_user_id, ev)
+        for uid, old_ev in old_map.items():
+            # если UID ещё есть в new_map – это не "пропажа"
+            if uid in new_map:
                 continue
 
-            # уже было — смотрим изменения
-            old_start = old_ev["start"]
-            old_end = old_ev["end"]
-            old_status = (old_ev["status"] or "").upper()
+            # если раньше уже был статус CANCELLED – не спамим повторно
+            old_status = (old_ev.get("status") or "").upper()
+            if old_status == "CANCELLED":
+                continue
 
-            new_start = ev["start"].isoformat() if isinstance(ev["start"], datetime) else str(ev["start"])
-            new_end_val = ev.get("end")
-            new_end = new_end_val.isoformat() if isinstance(new_end_val, datetime) else (new_end_val or "")
-            new_status = (ev.get("status") or "").upper()
+            # аккуратно парсим даты
+            try:
+                start_old = datetime.fromisoformat(old_ev["start"])
+            except Exception:
+                continue
 
-            moved = (old_start != new_start) or (old_end != new_end)
-            status_changed = (old_status != new_status)
+            end_str = old_ev.get("end") or ""
+            end_old = None
+            if end_str:
+                try:
+                    end_old = datetime.fromisoformat(end_str)
+                except Exception:
+                    end_old = None
 
-            # сразу сохраняем новое состояние
-            upsert_tracked_event(mm_user_id, ev)
+            def normalize(dt):
+                if not isinstance(dt, datetime):
+                    return None
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=tz_local)
+                return dt.astimezone(tz_local)
 
-            if status_changed and new_status == "CANCELLED":
-                # если мы сами только что жали "Отклонить" — не спамим
-                if should_suppress_cancel_notification(mm_user_id, uid):
-                    continue
+            start_old = normalize(start_old)
+            end_old = normalize(end_old) if end_old else None
 
-                send_event_cancelled_notification(mm_user_id, ev)
-            elif moved:
-                ...
-                # дата/время изменились
-                send_event_rescheduled_notification(mm_user_id, old_ev, ev)
+            if not start_old:
+                continue
 
-        # Можно было бы ещё обрабатывать случаи, когда событие пропало полностью
-        # из new_map (удалено без STATUS:CANCELLED), но Mail.ru обычно шлёт CANCELLED.
+            # если встреча уже давно в прошлом – не шлём "отменена"
+            if end_old and end_old < now_local:
+                continue
+            if not end_old and start_old < now_local:
+                continue
+
+            # если мы только что сами её отклонили – подавляем уведомление
+            if should_suppress_cancel_notification(mm_user_id, uid):
+                continue
+
+            pseudo_ev = {
+                "uid": uid,
+                "summary": old_ev.get("summary"),
+                "start": start_old,
+                "end": end_old,
+            }
+
+            send_event_cancelled_notification(mm_user_id, pseudo_ev)
+            # чтобы не слать повторно на следующих итерациях
+            delete_tracked_event(mm_user_id, uid)
 
 def handle_action_summary(user_id, only_future):
     user = get_user(user_id)
