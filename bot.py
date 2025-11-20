@@ -813,6 +813,14 @@ def get_today_events(email, password, only_future=False):
 
         uid_prop = getattr(vevent, "uid", None)
         uid = uid_prop.value if uid_prop else None
+        
+        # --- НОВОЕ: фильтруем отменённые события ---
+        status_prop = getattr(vevent, "status", None)
+        status = status_prop.value.upper() if status_prop else "CONFIRMED"
+        if status == "CANCELLED":
+            # пропускаем отменённые инстансы/встречи
+            continue
+        # --- КОНЕЦ НОВОГО БЛОКА ---
 
         desc_val = description.value if description else ""
 
