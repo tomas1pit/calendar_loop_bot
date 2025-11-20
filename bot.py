@@ -166,6 +166,21 @@ def init_db():
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mattermost_user_id TEXT,
+                uid TEXT,
+                start TEXT,
+                end TEXT,
+                status TEXT,
+                summary TEXT,
+                updated_at TEXT,
+                UNIQUE(mattermost_user_id, uid)
+            )
+            """
+        )
         conn.commit()
 
 def create_draft(mattermost_user_id, step="ASK_TITLE"):
@@ -638,6 +653,52 @@ def build_cancel_only_props():
         ]
     }
 
+def build_event_rsvp_props(uid):
+    return {
+        "attachments": [
+            {
+                "text": "Ответить на приглашение:",
+                "actions": [
+                    {
+                        "name": "Принять",
+                        "style": "primary",
+                        "integration": {
+                            "url": MM_ACTIONS_URL,
+                            "context": {
+                                "action": "event_rsvp",
+                                "choice": "ACCEPTED",
+                                "uid": uid,
+                            },
+                        },
+                    },
+                    {
+                        "name": "Возможно",
+                        "integration": {
+                            "url": MM_ACTIONS_URL,
+                            "context": {
+                                "action": "event_rsvp",
+                                "choice": "TENTATIVE",
+                                "uid": uid,
+                            },
+                        },
+                    },
+                    {
+                        "name": "Отклонить",
+                        "style": "danger",
+                        "integration": {
+                            "url": MM_ACTIONS_URL,
+                            "context": {
+                                "action": "event_rsvp",
+                                "choice": "DECLINED",
+                                "uid": uid,
+                            },
+                        },
+                    },
+                ],
+            }
+        ]
+    }
+
 def build_participants_step_props():
     return {
         "attachments": [
@@ -785,6 +846,95 @@ def get_caldav_client(email, password):
 
     principal = caldav.Principal(client=client, url=principal_url)
     return client, principal
+
+def get_events_for_tracking(email, password):
+    """
+    Сырые события для трекинга изменений.
+    Берём диапазон: вчера..+30 дней.
+    Не фильтруем STATUS=CANCELLED.
+    """
+    if caldav is None:
+        return []
+
+    tz_local = tz.gettz(TZ_NAME)
+    now_local = datetime.now(tz_local)
+
+    start_range = (now_local - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    end_range = (now_local + timedelta(days=30)).replace(
+        hour=23, minute=59, second=59, microsecond=0
+    )
+
+    cal = get_primary_calendar(email, password)
+    events = cal.date_search(start_range, end_range)
+    result = []
+
+    for event in events:
+        try:
+            vevent = event.vobject_instance.vevent
+        except Exception:
+            continue
+
+        summary = getattr(vevent, "summary", None)
+        description = getattr(vevent, "description", None)
+        dtstart = vevent.dtstart.value
+        dtend_prop = getattr(vevent, "dtend", None)
+        dtend = dtend_prop.value if dtend_prop else None
+
+        uid_prop = getattr(vevent, "uid", None)
+        uid = uid_prop.value if uid_prop else None
+        if not uid:
+            continue
+
+        status_prop = getattr(vevent, "status", None)
+        status = status_prop.value.upper() if status_prop else "CONFIRMED"
+
+        desc_val = description.value if description else ""
+
+        url_prop = getattr(vevent, "url", None)
+        url = url_prop.value if url_prop else None
+
+        attendees = []
+        for comp in vevent.contents.get("attendee", []):
+            val = comp.value
+            if isinstance(val, str) and val.lower().startswith("mailto:"):
+                val = val[7:]
+
+            params = getattr(comp, "params", {}) or {}
+            partstats = params.get("PARTSTAT") or params.get("partstat") or ["NEEDS-ACTION"]
+            a_status = str(partstats[0]).upper()
+
+            attendees.append(
+                {
+                    "email": val,
+                    "status": a_status,
+                }
+            )
+
+        if not isinstance(dtstart, datetime):
+            continue
+        if dtstart.tzinfo is None:
+            dtstart = dtstart.replace(tzinfo=tz_local)
+        if dtend and dtend.tzinfo is None:
+            dtend = dtend.replace(tzinfo=tz_local)
+
+        result.append(
+            {
+                "uid": uid,
+                "summary": summary.value if summary else "(без названия)",
+                "description": desc_val,
+                "start": dtstart,
+                "end": dtend,
+                "url": url,
+                "attendees": attendees,
+                "status": status,
+            }
+        )
+
+    # сортируем по старту
+    result.sort(key=lambda e: e["start"])
+    return result
 
 def get_today_events(email, password, only_future=False):
     if caldav is None:
@@ -1189,6 +1339,71 @@ def format_when(start, end):
     else:
         return start.strftime("%d.%m.%Y %H:%M")
 
+def load_tracked_events_for_user(mattermost_user_id):
+    """
+    Загружаем сохранённое состояние событий пользователя.
+    Возвращаем dict[uid] -> запись.
+    """
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT uid, start, end, status, summary
+            FROM tracked_events
+            WHERE mattermost_user_id = ?
+            """,
+            (mattermost_user_id,),
+        )
+        rows = c.fetchall()
+
+    res = {}
+    for uid, start, end, status, summary in rows:
+        res[uid] = {
+            "uid": uid,
+            "start": start,
+            "end": end,
+            "status": status,
+            "summary": summary,
+        }
+    return res
+
+
+def upsert_tracked_event(mattermost_user_id, ev):
+    """
+    ev: dict с ключами uid, start, end, status, summary
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    start_str = ev["start"].isoformat() if isinstance(ev["start"], datetime) else str(ev["start"])
+    end_val = ev.get("end")
+    end_str = end_val.isoformat() if isinstance(end_val, datetime) else (end_val or "")
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO tracked_events (mattermost_user_id, uid, start, end, status, summary, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mattermost_user_id, uid)
+            DO UPDATE SET
+                start = excluded.start,
+                end = excluded.end,
+                status = excluded.status,
+                summary = excluded.summary,
+                updated_at = excluded.updated_at
+            """,
+            (
+                mattermost_user_id,
+                ev["uid"],
+                start_str,
+                end_str,
+                ev.get("status") or "",
+                ev.get("summary") or "",
+                now_iso,
+            ),
+        )
+        conn.commit()
+
 STATUS_EMOJI = {
     "ACCEPTED": "✅",
     "DECLINED": "❌",
@@ -1297,6 +1512,100 @@ def handle_show_event_details(user_id, context):
 
     text = format_event_details(title, when_human, attendees, description, url)
     mm_send_dm(user_id, text)
+
+def handle_event_rsvp(user_id, uid, choice):
+    """
+    choice: 'ACCEPTED', 'DECLINED', 'TENTATIVE'
+    """
+    user = get_user(user_id)
+    if not user or user["state"] != "READY":
+        mm_send_dm(user_id, "Сначала нужно авторизоваться.")
+        return
+
+    if choice not in ("ACCEPTED", "DECLINED", "TENTATIVE"):
+        mm_send_dm(user_id, "Неизвестный ответ на приглашение.")
+        return
+
+    email = user["email"]
+    pwd = user["caldav_password"]
+
+    try:
+        updated = update_event_partstat(email, pwd, uid, choice)
+    except Exception:
+        updated = False
+
+    if updated:
+        human = {
+            "ACCEPTED": "приняли",
+            "DECLINED": "отклонили",
+            "TENTATIVE": "ответили «возможно»",
+        }[choice]
+        mm_send_dm(user_id, f"Ок, вы {human} приглашение на встречу.")
+    else:
+        mm_send_dm(
+            user_id,
+            "Не получилось обновить статус встречи в календаре. "
+            "Возможно, CalDAV не даёт изменить это событие."
+        )
+
+
+def update_event_partstat(email, password, uid, new_status):
+    """
+    Пытаемся найти событие по UID и обновить PARTSTAT для текущего пользователя.
+    Возвращает True при успехе, False при ошибке/отсутствии.
+    """
+    if caldav is None:
+        return False
+
+    client, principal = get_caldav_client(email, password)
+    cal = get_primary_calendar(email, password)
+
+    try:
+        events = cal.events()
+    except Exception:
+        return False
+
+    updated = False
+
+    for ev in events:
+        try:
+            vcal = ev.vobject_instance
+        except Exception:
+            continue
+
+        changed_any = False
+
+        # На случай, если в одном ресурсе несколько VEVENT
+        for comp in vcal.components():
+            if comp.name != "VEVENT":
+                continue
+
+            uid_prop = getattr(comp, "uid", None)
+            if not uid_prop or uid_prop.value != uid:
+                continue
+
+            attendees = comp.contents.get("attendee", [])
+            for att in attendees:
+                val = att.value
+                if isinstance(val, str) and val.lower().startswith("mailto:"):
+                    addr = val[7:]
+                else:
+                    addr = val
+
+                if addr.lower() != email.lower():
+                    continue
+
+                att.params["PARTSTAT"] = [new_status]
+                changed_any = True
+
+        if changed_any:
+            try:
+                ev.save()
+                updated = True
+            except Exception:
+                continue
+
+    return updated
 
 def handle_meeting_draft_step(user_id, channel_id, user, draft, text):
     step = draft["step"]
@@ -1464,6 +1773,56 @@ def handle_meeting_draft_step(user_id, channel_id, user, draft, text):
         return True
 
     return False
+
+def send_new_event_notification(mattermost_user_id, ev):
+    when_str = format_when(ev["start"], ev.get("end"))
+    text = format_event_details(
+        title=ev.get("summary"),
+        when_human=when_str,
+        attendees=ev.get("attendees") or [],
+        description=ev.get("description") or "",
+        url=ev.get("url") or "",
+        header_prefix="### 🆕 Новая встреча",
+    )
+    props = build_event_rsvp_props(ev["uid"])
+    mm_send_dm(mattermost_user_id, text, props=props)
+
+
+def send_event_rescheduled_notification(mattermost_user_id, old_ev, new_ev):
+    old_when = format_when(
+        datetime.fromisoformat(old_ev["start"]),
+        datetime.fromisoformat(old_ev["end"]) if old_ev["end"] else None,
+    )
+    new_when = format_when(new_ev["start"], new_ev.get("end"))
+
+    lines = [
+        "### 🔁 Встреча перенесена",
+        f"**{new_ev.get('summary') or old_ev.get('summary') or '(без названия)'}**",
+        f"Было: {old_when}",
+        f"Стало: {new_when}",
+        "",
+    ]
+
+    details = format_event_details(
+        title=new_ev.get("summary"),
+        when_human=new_when,
+        attendees=new_ev.get("attendees") or [],
+        description=new_ev.get("description") or "",
+        url=new_ev.get("url") or "",
+    )
+    text = "\n".join(lines) + "\n" + details
+    props = build_event_rsvp_props(new_ev["uid"])
+    mm_send_dm(mattermost_user_id, text, props=props)
+
+
+def send_event_cancelled_notification(mattermost_user_id, ev):
+    when_str = format_when(ev["start"], ev.get("end"))
+    lines = [
+        "### ❌ Встреча отменена",
+        f"**{ev.get('summary') or '(без названия)'}**",
+        f"Когда было запланировано: {when_str}",
+    ]
+    mm_send_dm(mattermost_user_id, "\n".join(lines))
 
 WELCOME_TEXT_TEMPLATE = """Привет! Для начала надо авторизоваться в твоём календаре.
 
@@ -1746,6 +2105,79 @@ def job_event_alarms():
             except Exception:
                 continue
 
+def job_event_changes():
+    """
+    Отслеживает:
+    - новые встречи (в будущем/прошлом в пределах окна) → уведомление + кнопки Принять/Отклонить/Возможно
+    - изменения даты/времени → уведомление о переносе
+    - отмену встречи (STATUS:CANCELLED) → уведомление об отмене
+    """
+    if ENCRYPTION_MISCONFIGURED:
+        return
+
+    users = get_all_ready_users()
+    for user in users:
+        mm_user_id = user["mattermost_user_id"]
+        email = user["email"]
+        pwd = user["caldav_password"]
+
+        try:
+            new_events = get_events_for_tracking(email, pwd)
+        except Exception:
+            continue
+
+        # старое состояние
+        old_map = load_tracked_events_for_user(mm_user_id)
+        first_sync = len(old_map) == 0
+
+        # мапа uid -> ev
+        new_map = {ev["uid"]: ev for ev in new_events}
+
+        # если это первый прогон для пользователя — просто заполняем таблицу,
+        # чтобы не спамить всеми старыми событиями
+        if first_sync:
+            for ev in new_events:
+                upsert_tracked_event(mm_user_id, ev)
+            continue
+
+        for uid, ev in new_map.items():
+            old_ev = old_map.get(uid)
+
+            if not old_ev:
+                # новое событие
+                upsert_tracked_event(mm_user_id, ev)
+                if ev.get("status") == "CANCELLED":
+                    # сразу пришло как отменённое — ничего не говорим
+                    continue
+                send_new_event_notification(mm_user_id, ev)
+                continue
+
+            # уже было — смотрим изменения
+            old_start = old_ev["start"]
+            old_end = old_ev["end"]
+            old_status = (old_ev["status"] or "").upper()
+
+            new_start = ev["start"].isoformat() if isinstance(ev["start"], datetime) else str(ev["start"])
+            new_end_val = ev.get("end")
+            new_end = new_end_val.isoformat() if isinstance(new_end_val, datetime) else (new_end_val or "")
+            new_status = (ev.get("status") or "").upper()
+
+            moved = (old_start != new_start) or (old_end != new_end)
+            status_changed = (old_status != new_status)
+
+            # сразу сохраняем новое состояние
+            upsert_tracked_event(mm_user_id, ev)
+
+            if status_changed and new_status == "CANCELLED":
+                # встреча отменена
+                send_event_cancelled_notification(mm_user_id, ev)
+            elif moved:
+                # дата/время изменились
+                send_event_rescheduled_notification(mm_user_id, old_ev, ev)
+
+        # Можно было бы ещё обрабатывать случаи, когда событие пропало полностью
+        # из new_map (удалено без STATUS:CANCELLED), но Mail.ru обычно шлёт CANCELLED.
+
 def handle_action_summary(user_id, only_future):
     user = get_user(user_id)
     if not user or user["state"] != "READY":
@@ -1956,6 +2388,11 @@ def mattermost_actions():
             clear_post_buttons(post_id)
             handle_cancel_meeting(user_id)
 
+        elif action == "event_rsvp":
+            uid = context.get("uid")
+            choice = (context.get("choice") or "").upper()
+            handle_event_rsvp(user_id, uid, choice)
+
         else:
             mm_send_dm(user_id, f"Неизвестное действие: {action}")
     except Exception:
@@ -1978,6 +2415,7 @@ def main():
 
     scheduler.add_job(job_daily_summary, "cron", hour=14, minute=0)
     scheduler.add_job(job_event_alarms, "interval", minutes=1)
+    scheduler.add_job(job_event_changes, "interval", minutes=5)
     scheduler.start()
 
     t = threading.Thread(target=websocket_loop, daemon=True)
