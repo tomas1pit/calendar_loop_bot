@@ -1548,7 +1548,9 @@ def format_event_details(title, when_human, attendees, description, url, header_
     else:
         lines.append("\nОписание: —")
 
-    location = (url or "").strip()  # пока используем url как поле "где"
+    # Поле "Где" — может содержать URL, адрес или любой текст
+    location = (url or "").strip()  # пока используем url как "локацию"
+
     if location:
         lines.append("\nГде:")
         for part in location.splitlines():
@@ -2209,15 +2211,31 @@ def job_event_alarms():
             except Exception:
                 continue
 
+def delete_tracked_event(mattermost_user_id, uid):
+    """
+    Удаляем событие из трекинга (чтобы не слать уведомления повторно).
+    """
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "DELETE FROM tracked_events WHERE mattermost_user_id = ? AND uid = ?",
+            (mattermost_user_id, uid),
+        )
+        conn.commit()
+
+
 def job_event_changes():
     """
     Отслеживает:
-    - новые встречи (в будущем/прошлом в пределах окна) → уведомление + кнопки Принять/Отклонить/Возможно
+    - новые встречи (в окне -1 день .. +30 дней) → уведомление + кнопки Принять/Отклонить/Возможно
     - изменения даты/времени → уведомление о переносе
-    - отмену встречи (STATUS:CANCELLED) → уведомление об отмене
+    - отмену встречи (STATUS:CANCELLED или пропала из выборки) → уведомление об отмене
     """
     if ENCRYPTION_MISCONFIGURED:
         return
+
+    tz_local = tz.gettz(TZ_NAME)
+    now_local = datetime.now(tz_local)
 
     users = get_all_ready_users()
     for user in users:
@@ -2230,33 +2248,58 @@ def job_event_changes():
         except Exception:
             continue
 
-        # старое состояние
         old_map = load_tracked_events_for_user(mm_user_id)
         first_sync = len(old_map) == 0
 
-        # мапа uid -> ev
         new_map = {ev["uid"]: ev for ev in new_events}
 
-        # если это первый прогон для пользователя — просто заполняем таблицу,
-        # чтобы не спамить всеми старыми событиями
+        # Первый прогон для этого пользователя — просто зафиксировали текущее состояние
         if first_sync:
             for ev in new_events:
                 upsert_tracked_event(mm_user_id, ev)
             continue
 
-        # 🔹 Обрабатываем события, которые ПРОПАЛИ из new_map
-        # (Mail.ru мог просто удалить их из выборки без STATUS:CANCELLED).
-        tz_local = tz.gettz(TZ_NAME)
-        now_local = datetime.now(tz_local)
+        # 1) новые и изменившиеся события
+        for uid, ev in new_map.items():
+            old_ev = old_map.get(uid)
 
+            if not old_ev:
+                # новое событие
+                upsert_tracked_event(mm_user_id, ev)
+                send_new_event_notification(mm_user_id, ev)
+                continue
+
+            old_start = old_ev["start"]
+            old_end = old_ev["end"]
+            old_status = (old_ev["status"] or "").upper()
+
+            new_start = ev["start"].isoformat() if isinstance(ev["start"], datetime) else str(ev["start"])
+            new_end_val = ev.get("end")
+            new_end = new_end_val.isoformat() if isinstance(new_end_val, datetime) else (new_end_val or "")
+            new_status = (ev.get("status") or "").upper()
+
+            moved = (old_start != new_start) or (old_end != new_end)
+            status_changed = (old_status != new_status)
+
+            upsert_tracked_event(mm_user_id, ev)
+
+            if status_changed and new_status == "CANCELLED":
+                # если мы сами только что жали RSVP — подавляем уведомление
+                if should_suppress_cancel_notification(mm_user_id, uid):
+                    continue
+                send_event_cancelled_notification(mm_user_id, ev)
+            elif moved:
+                # дата/время изменились
+                send_event_rescheduled_notification(mm_user_id, old_ev, ev)
+
+        # 2) события, которые были в tracked_events, но пропали из new_map
         for uid, old_ev in old_map.items():
-            # если UID ещё есть в new_map – это не "пропажа"
             if uid in new_map:
                 continue
 
-            # если раньше уже был статус CANCELLED – не спамим повторно
             old_status = (old_ev.get("status") or "").upper()
             if old_status == "CANCELLED":
+                # уже были когда-то отменены — не дублируем
                 continue
 
             # аккуратно парсим даты
@@ -2286,13 +2329,13 @@ def job_event_changes():
             if not start_old:
                 continue
 
-            # если встреча уже давно в прошлом – не шлём "отменена"
+            # если встреча уже завершилась — не шлём "отменена"
             if end_old and end_old < now_local:
                 continue
             if not end_old and start_old < now_local:
                 continue
 
-            # если мы только что сами её отклонили – подавляем уведомление
+            # если мы сами только что отменяли/отклоняли — подавляем
             if should_suppress_cancel_notification(mm_user_id, uid):
                 continue
 
@@ -2302,9 +2345,7 @@ def job_event_changes():
                 "start": start_old,
                 "end": end_old,
             }
-
             send_event_cancelled_notification(mm_user_id, pseudo_ev)
-            # чтобы не слать повторно на следующих итерациях
             delete_tracked_event(mm_user_id, uid)
 
 def handle_action_summary(user_id, only_future):
