@@ -1693,8 +1693,12 @@ def handle_new_dm_message(user_id, channel_id, text):
         if draft:
             if handle_meeting_draft_step(user_id, channel_id, user, draft, text):
                 return
-        if BOT_USERNAME in text or "@" + BOT_USERNAME in text:
-            send_main_menu(user_id)
+        if BOT_USERNAME:
+            lower_text = text.lower()
+            uname = BOT_USERNAME.lower()
+            if re.search(rf"@{re.escape(uname)}\b", lower_text):
+                send_main_menu(user_id)
+                return
         else:
             mm_send_dm(
                 user_id,
