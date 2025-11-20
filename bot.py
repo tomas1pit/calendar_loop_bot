@@ -485,9 +485,10 @@ def mm_get_me():
     return mm_get("/api/v4/users/me")
 
 def init_bot_identity():
-    global BOT_USER_ID
+    global BOT_USER_ID, BOT_USERNAME
     me = mm_get_me()
     BOT_USER_ID = me["id"]
+    BOT_USERNAME = (me.get("username") or BOT_USERNAME or "").strip()
 
 def mm_update_post(post_id, message):
     data = {"id": post_id, "message": message}
@@ -1685,20 +1686,26 @@ def handle_new_dm_message(user_id, channel_id, text):
         send_main_menu(user_id)
         return
     if user["state"] == "READY":
-        txt_lower = text.strip().lower()
+        txt_stripped = text.strip()
+        txt_lower = txt_stripped.lower()
+        bot_name = (BOT_USERNAME or "").lower()
+
         if txt_lower.startswith("debug caldav"):
             debug_dump_caldav_events(user_id)
             return
+
         draft = get_active_draft(user_id)
         if draft:
             if handle_meeting_draft_step(user_id, channel_id, user, draft, text):
                 return
-        if BOT_USERNAME:
-            lower_text = text.lower()
-            uname = BOT_USERNAME.lower()
-            if re.search(rf"@{re.escape(uname)}\b", lower_text):
-                send_main_menu(user_id)
-                return
+
+        if bot_name and (
+            txt_lower == bot_name
+            or txt_lower == f"@{bot_name}"
+            or bot_name in txt_lower
+            or f"@{bot_name}" in txt_lower
+        ):
+            send_main_menu(user_id)
         else:
             mm_send_dm(
                 user_id,
