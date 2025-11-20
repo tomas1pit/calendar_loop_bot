@@ -181,6 +181,17 @@ def init_db():
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rsvp_suppress (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mattermost_user_id TEXT,
+                uid TEXT,
+                suppress_until TEXT,
+                UNIQUE(mattermost_user_id, uid)
+            )
+            """
+        )
         conn.commit()
 
 def create_draft(mattermost_user_id, step="ASK_TITLE"):
@@ -699,6 +710,62 @@ def build_event_rsvp_props(uid):
         ]
     }
 
+def set_rsvp_suppress(mattermost_user_id, uid, minutes=10):
+    """
+    После собственного RSVP временно подавляем уведомление
+    'Встреча отменена' по этому UID.
+    """
+    until_dt = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    until_str = until_dt.isoformat()
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO rsvp_suppress (mattermost_user_id, uid, suppress_until)
+            VALUES (?, ?, ?)
+            ON CONFLICT(mattermost_user_id, uid)
+            DO UPDATE SET suppress_until = excluded.suppress_until
+            """,
+            (mattermost_user_id, uid, until_str),
+        )
+        conn.commit()
+
+
+def should_suppress_cancel_notification(mattermost_user_id, uid) -> bool:
+    """
+    True, если для этого события сейчас надо подавить уведомление
+    'Встреча отменена'.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT suppress_until FROM rsvp_suppress
+            WHERE mattermost_user_id = ? AND uid = ?
+            """,
+            (mattermost_user_id, uid),
+        )
+        row = c.fetchone()
+
+        if not row:
+            return False
+
+        suppress_until = row[0] or ""
+
+        # если окно уже прошло — чистим запись и не подавляем
+        if suppress_until <= now_iso:
+            c.execute(
+                "DELETE FROM rsvp_suppress WHERE mattermost_user_id = ? AND uid = ?",
+                (mattermost_user_id, uid),
+            )
+            conn.commit()
+            return False
+
+    return True
+
 def build_participants_step_props():
     return {
         "attachments": [
@@ -919,6 +986,12 @@ def get_events_for_tracking(email, password):
         if dtend and dtend.tzinfo is None:
             dtend = dtend.replace(tzinfo=tz_local)
 
+        created_by_bot = False
+        for key, vals in vevent.contents.items():
+            if key.lower() in ("x-calendar-bot", "x_calendar_bot"):
+                created_by_bot = True
+                break
+
         result.append(
             {
                 "uid": uid,
@@ -929,6 +1002,7 @@ def get_events_for_tracking(email, password):
                 "url": url,
                 "attendees": attendees,
                 "status": status,
+                "created_by_bot": created_by_bot,
             }
         )
 
@@ -1162,6 +1236,8 @@ def create_calendar_event_from_draft(email, password, draft):
         att.value = f"mailto:{addr}"
         att.params["CN"] = [addr]
         att.params["ROLE"] = ["REQ-PARTICIPANT"]
+
+    vevent.add("x-calendar-bot").value = "1"
 
     ical_str = vcal.serialize()
     cal.add_event(ical_str)
@@ -1535,6 +1611,8 @@ def handle_event_rsvp(user_id, uid, choice):
         updated = False
 
     if updated:
+        set_rsvp_suppress(user_id, uid, minutes=10)
+
         human = {
             "ACCEPTED": "приняли",
             "DECLINED": "отклонили",
@@ -2146,9 +2224,13 @@ def job_event_changes():
             if not old_ev:
                 # новое событие
                 upsert_tracked_event(mm_user_id, ev)
+
+                # если событие уже CANCELLED или создано самим ботом — молчим
                 if ev.get("status") == "CANCELLED":
-                    # сразу пришло как отменённое — ничего не говорим
                     continue
+                if ev.get("created_by_bot"):
+                    continue
+
                 send_new_event_notification(mm_user_id, ev)
                 continue
 
@@ -2169,9 +2251,13 @@ def job_event_changes():
             upsert_tracked_event(mm_user_id, ev)
 
             if status_changed and new_status == "CANCELLED":
-                # встреча отменена
+                # если мы сами только что жали "Отклонить" — не спамим
+                if should_suppress_cancel_notification(mm_user_id, uid):
+                    continue
+
                 send_event_cancelled_notification(mm_user_id, ev)
             elif moved:
+                ...
                 # дата/время изменились
                 send_event_rescheduled_notification(mm_user_id, old_ev, ev)
 
@@ -2389,6 +2475,8 @@ def mattermost_actions():
             handle_cancel_meeting(user_id)
 
         elif action == "event_rsvp":
+            clear_post_buttons(post_id)
+
             uid = context.get("uid")
             choice = (context.get("choice") or "").upper()
             handle_event_rsvp(user_id, uid, choice)
