@@ -1,0 +1,8 @@
+requests
+websocket-client
+Flask
+APScheduler
+caldav
+python-dateutil
+vobject
+cryptography
