@@ -986,12 +986,6 @@ def get_events_for_tracking(email, password):
         if dtend and dtend.tzinfo is None:
             dtend = dtend.replace(tzinfo=tz_local)
 
-        created_by_bot = False
-        for key, vals in vevent.contents.items():
-            if key.lower() in ("x-calendar-bot", "x_calendar_bot"):
-                created_by_bot = True
-                break
-
         result.append(
             {
                 "uid": uid,
@@ -1002,7 +996,6 @@ def get_events_for_tracking(email, password):
                 "url": url,
                 "attendees": attendees,
                 "status": status,
-                "created_by_bot": created_by_bot,
             }
         )
 
@@ -1186,7 +1179,7 @@ def resolve_participants_from_text(text: str):
 
     return sorted(emails)
 
-def create_calendar_event_from_draft(email, password, draft):
+def create_calendar_event_from_draft(mattermost_user_id, email, password, draft):
     tz_local = tz.gettz(TZ_NAME)
 
     try:
@@ -1216,10 +1209,16 @@ def create_calendar_event_from_draft(email, password, draft):
 
     vcal = vobject.iCalendar()
     vevent = vcal.add("vevent")
-    vevent.add("uid").value = str(uuid.uuid4())
+
+    # генерируем UID сами, чтобы потом использовать его в tracked_events
+    uid = str(uuid.uuid4())
+    vevent.add("uid").value = uid
     vevent.add("summary").value = title
     vevent.add("dtstart").value = start_dt
     vevent.add("dtend").value = end_dt
+
+    # можно сразу задать статус, чтобы в трекинге было что-то осмысленное
+    vevent.add("status").value = "CONFIRMED"
 
     if description:
         vevent.add("description").value = description
@@ -1237,12 +1236,28 @@ def create_calendar_event_from_draft(email, password, draft):
         att.params["CN"] = [addr]
         att.params["ROLE"] = ["REQ-PARTICIPANT"]
 
-    vevent.add("x-calendar-bot").value = "1"
-
     ical_str = vcal.serialize()
     cal.add_event(ical_str)
 
+    # 🔹 СРАЗУ добавляем/обновляем запись в tracked_events,
+    # чтобы job_event_changes НЕ воспринял событие как "новое"
+    try:
+        upsert_tracked_event(
+            mattermost_user_id,
+            {
+                "uid": uid,
+                "summary": title,
+                "start": start_dt,
+                "end": end_dt,
+                "status": "CONFIRMED",
+            },
+        )
+    except Exception:
+        # на работу бота это не должно влиять, максимум потеряем один трекинг
+        pass
+
     return {
+        "uid": uid,
         "title": title,
         "start": start_dt,
         "end": end_dt,
@@ -1817,6 +1832,7 @@ def handle_meeting_draft_step(user_id, channel_id, user, draft, text):
         clear_last_bot_buttons_in_channel(channel_id)
         try:
             event_info = create_calendar_event_from_draft(
+                user_id,
                 user["email"],
                 user["caldav_password"],
                 {**draft, "location": location},
@@ -2224,13 +2240,6 @@ def job_event_changes():
             if not old_ev:
                 # новое событие
                 upsert_tracked_event(mm_user_id, ev)
-
-                # если событие уже CANCELLED или создано самим ботом — молчим
-                if ev.get("status") == "CANCELLED":
-                    continue
-                if ev.get("created_by_bot"):
-                    continue
-
                 send_new_event_notification(mm_user_id, ev)
                 continue
 
@@ -2360,6 +2369,7 @@ def handle_skip_location(user_id):
     update_draft(draft["id"], step="CREATING")
     try:
         event_info = create_calendar_event_from_draft(
+            user_id,
             user["email"],
             user["caldav_password"],
             {**draft, "location": ""},
