@@ -1536,18 +1536,15 @@ def format_event_details(title, when_human, attendees, description, url, header_
     else:
         lines.append("\nОписание: —")
 
-    # Поле "Где" — может содержать URL, адрес или любой текст
-    location = (url or "").strip()  # url используется как поле location
-
+    location = (url or "").strip()  # пока используем url как поле "где"
     if location:
         lines.append("\nГде:")
-        # Разбиваем по переносам, чтобы поддержать многострочные локации
         for part in location.splitlines():
             lines.append(part)
     else:
         lines.append("\nГде: —")
 
-        return "\n".join(lines)
+    return "\n".join(lines)
 
 def handle_show_event_details_select(user_id, payload):
     context = payload.get("context", {}) or {}
@@ -1626,7 +1623,8 @@ def handle_event_rsvp(user_id, uid, choice):
         updated = False
 
     if updated:
-        set_rsvp_suppress(user_id, uid, minutes=10)
+        if choice == "DECLINED":
+            set_rsvp_suppress(user_id, uid, minutes=10)
 
         human = {
             "ACCEPTED": "приняли",
