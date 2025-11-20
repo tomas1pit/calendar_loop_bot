@@ -38,6 +38,9 @@ if ENCRYPTION_KEY and ENCRYPTION_KEY != "DISABLED":
 
 ENCRYPTION_MISCONFIGURED = False
 
+MENTION_RE = re.compile(r"@([a-zA-Z0-9._-]+)")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
 DB_PATH = os.getenv("DB_PATH", "./calendar_bot.db")
 
 from contextlib import contextmanager
@@ -508,6 +511,24 @@ def mm_put(path, data):
     resp.raise_for_status()
     return resp.json()
 
+def mm_get_users_by_usernames(usernames):
+    usernames = [u.strip() for u in usernames if u and u.strip()]
+    if not usernames:
+        return {}
+
+    try:
+        users = mm_post("/api/v4/users/usernames", usernames)
+    except Exception:
+        return {}
+
+    mapping = {}
+    for u in users:
+        uname = (u.get("username") or "").strip().lower()
+        email = (u.get("email") or "").strip()
+        if uname and email:
+            mapping[uname] = email
+    return mapping
+
 def mm_update_post_raw(post_id, message=None, props=None):
     data = {"id": post_id}
     if message is not None:
@@ -916,6 +937,22 @@ def debug_dump_caldav_events(user_id):
 
     full_text = "\n\n".join(chunks)
     mm_send_long_dm(user_id, full_text)
+
+def resolve_participants_from_text(text: str):
+    if not text:
+        return []
+
+    emails = {m.strip().lower() for m in EMAIL_RE.findall(text)}
+
+    usernames = {m.strip().lower() for m in MENTION_RE.findall(text)}
+
+    if usernames:
+        username_map = mm_get_users_by_usernames(list(usernames))
+        for uname, email in username_map.items():
+            if email:
+                emails.add(email.strip().lower())
+
+    return sorted(emails)
 
 def create_calendar_event_from_draft(email, password, draft):
     tz_local = tz.gettz(TZ_NAME)
@@ -1338,16 +1375,24 @@ def handle_meeting_draft_step(user_id, channel_id, user, draft, text):
         clear_last_bot_buttons_in_channel(channel_id)
         mm_send_dm(
             user_id,
-            "Кого пригласить на встречу? Напиши e-mail адреса через запятую.\n"
+            "Кого пригласить на встречу?\n"
+            "Можно указывать участников в любом формате:\n"
+            "• @username — бот сам найдёт e-mail\n"
+            "• email@example.com — можно несколько через запятую или с новой строки\n\n"
+            "Пример:\n"
+            "@ivanov, @petrova\n"
+            "external@mail.com\n\n"
             "Если никого не нужно приглашать, нажми кнопку «Не выбирать».",
             props=build_participants_step_props(),
         )
         return True
 
     if step == "ASK_PARTICIPANTS":
-        participants = ""
-        if txt.lower() not in ("нет", "нет.", "no", "none"):
-            participants = txt
+        if txt.lower() in ("нет", "нет.", "no", "none"):
+            participants = ""
+        else:
+            emails = resolve_participants_from_text(txt)
+            participants = ", ".join(emails) if emails else ""
 
         update_draft(draft["id"], participants=participants, step="ASK_DESCRIPTION")
         clear_last_bot_buttons_in_channel(channel_id)
