@@ -210,12 +210,35 @@ def init_db():
             try:
                 if not _has_column(conn, "event_snapshots", "organizer_email"):
                     conn.execute("ALTER TABLE event_snapshots ADD COLUMN organizer_email TEXT")
+                if not _has_column(conn, "event_snapshots", "alarms"):
+                    conn.execute("ALTER TABLE event_snapshots ADD COLUMN alarms TEXT")
             except Exception:
                 pass
 
             conn.commit()
         except Exception:
             # swallow any unexpected errors during migration to avoid stopping startup
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        # Reminder history table to avoid duplicate sends
+        try:
+            c = conn.cursor()
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reminder_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mattermost_user_id TEXT,
+                    uid TEXT,
+                    alarm_time TEXT,
+                    sent_at TEXT,
+                    UNIQUE(mattermost_user_id, uid, alarm_time)
+                )
+                """
+            )
+            conn.commit()
+        except Exception:
             try:
                 conn.rollback()
             except Exception:
@@ -794,6 +817,120 @@ def extract_organizer_email(vevent):
         val = val[7:]
     return (val or "").strip().lower() or None
 
+
+def _parse_iso_duration_minutes(s: str) -> int | None:
+    # Very small helper to parse simple ISO8601 durations like -PT15M or PT30M
+    if not s or not isinstance(s, str):
+        return None
+    m = re.match(r"^-?P(T(?:(\d+)H)?(?:(\d+)M)?)$", s)
+    if not m:
+        return None
+    hours = int(m.group(2)) if m.group(2) else 0
+    mins = int(m.group(3)) if m.group(3) else 0
+    total = hours * 60 + mins
+    if s.startswith("-"):
+        return -total
+    return total
+
+
+def extract_alarms_from_vevent(vevent, event_start):
+    # Returns list of ISO timestamps (UTC-aware if event_start has tzinfo)
+    alarms = []
+    try:
+        # vobject stores VALARM as 'valarm' key in contents
+        alarm_comps = vevent.contents.get("valarm", []) or []
+        for ac in alarm_comps:
+            trig = getattr(ac, "trigger", None)
+            if not trig:
+                continue
+            val = trig.value
+            trigger_dt = None
+            # If it's a timedelta-like object
+            if hasattr(val, "total_seconds"):
+                # val is timedelta
+                try:
+                    trigger_dt = event_start + val
+                except Exception:
+                    trigger_dt = None
+            elif isinstance(val, datetime):
+                trigger_dt = val
+            elif isinstance(val, str):
+                # Try ISO datetime first
+                try:
+                    trigger_dt = datetime.fromisoformat(val)
+                except Exception:
+                    # Try simple ISO duration like -PT15M
+                    mins = _parse_iso_duration_minutes(val)
+                    if mins is not None:
+                        trigger_dt = event_start + timedelta(minutes=mins)
+            if trigger_dt is not None:
+                # Normalize to ISO with tz if possible
+                if trigger_dt.tzinfo is None and getattr(event_start, "tzinfo", None) is not None:
+                    trigger_dt = trigger_dt.replace(tzinfo=event_start.tzinfo)
+                alarms.append(trigger_dt.isoformat())
+    except Exception:
+        pass
+    return alarms
+
+
+def parse_vevent(vevent, tz_local):
+    """Parse a vobject VEVENT into our internal event dict.
+
+    Returns a dict with keys: uid, summary, description, start (datetime), end (datetime|None),
+    url, attendees (list), status, organizer_email, alarms (list of ISO strings).
+    """
+    summary = getattr(vevent, "summary", None)
+    description = getattr(vevent, "description", None)
+    dtstart = vevent.dtstart.value
+    dtend_prop = getattr(vevent, "dtend", None)
+    dtend = dtend_prop.value if dtend_prop else None
+    uid_prop = getattr(vevent, "uid", None)
+    uid = uid_prop.value if uid_prop else None
+    if not uid:
+        return None
+    status_prop = getattr(vevent, "status", None)
+    status = status_prop.value.upper() if status_prop else "CONFIRMED"
+    desc_val = description.value if description else ""
+    url_prop = getattr(vevent, "url", None)
+    url = url_prop.value if url_prop else None
+    attendees = []
+    for comp in vevent.contents.get("attendee", []):
+        val = comp.value
+        if isinstance(val, str) and val.lower().startswith("mailto:"):
+            val = val[7:]
+        params = getattr(comp, "params", {}) or {}
+        partstats = params.get("PARTSTAT") or params.get("partstat") or ["NEEDS-ACTION"]
+        a_status = str(partstats[0]).upper()
+        attendees.append({"email": val, "status": a_status})
+    # normalize datetimes to tz_local
+    if not isinstance(dtstart, datetime):
+        return None
+    if dtstart.tzinfo is None:
+        dtstart = dtstart.replace(tzinfo=tz_local)
+    else:
+        dtstart = dtstart.astimezone(tz_local)
+    if dtend and isinstance(dtend, datetime):
+        if dtend.tzinfo is None:
+            dtend = dtend.replace(tzinfo=tz_local)
+        else:
+            dtend = dtend.astimezone(tz_local)
+    organizer_email = extract_organizer_email(vevent)
+    if status == "CANCELLED":
+        return None
+    ev = {
+        "uid": uid,
+        "summary": summary.value if summary else "(без названия)",
+        "description": desc_val,
+        "start": dtstart,
+        "end": dtend,
+        "url": url,
+        "attendees": attendees,
+        "status": status,
+        "organizer_email": organizer_email,
+        "alarms": extract_alarms_from_vevent(vevent, dtstart),
+    }
+    return ev
+
 def get_events_for_tracking(email, password):
     if caldav is None:
         return []
@@ -862,6 +999,7 @@ def get_events_for_tracking(email, password):
                 "attendees": attendees,
                 "status": status,
                 "organizer_email": organizer_email,
+                "alarms": extract_alarms_from_vevent(vevent, dtstart),
             }
         )
     result.sort(key=lambda e: e["start"])
@@ -935,6 +1073,7 @@ def get_today_events(email, password, only_future=False):
                 "end": dtend,
                 "url": url,
                 "attendees": attendees,
+                "alarms": extract_alarms_from_vevent(vevent, dtstart),
             }
         )
     result.sort(key=lambda e: e["start"])
@@ -1414,12 +1553,13 @@ def upsert_snapshot(mattermost_user_id, ev):
     start_str = ev["start"].isoformat() if isinstance(ev["start"], datetime) else str(ev["start"])
     end_val = ev.get("end")
     end_str = end_val.isoformat() if isinstance(end_val, datetime) else (end_val or "")
+    alarms_json = json.dumps(ev.get("alarms") or [])
     with db_conn() as conn:
         c = conn.cursor()
         c.execute(
             """
-            INSERT INTO event_snapshots (mattermost_user_id, uid, start, end, status, summary, organizer_email, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO event_snapshots (mattermost_user_id, uid, start, end, status, summary, organizer_email, alarms, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mattermost_user_id, uid)
             DO UPDATE SET
                 start = excluded.start,
@@ -1427,6 +1567,7 @@ def upsert_snapshot(mattermost_user_id, ev):
                 status = excluded.status,
                 summary = excluded.summary,
                 organizer_email = excluded.organizer_email,
+                alarms = excluded.alarms,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1437,6 +1578,7 @@ def upsert_snapshot(mattermost_user_id, ev):
                 ev.get("status") or "",
                 ev.get("summary") or "",
                 (ev.get("organizer_email") or "") if isinstance(ev.get("organizer_email"), str) else "",
+                alarms_json,
                 now_iso,
             ),
         )
@@ -1462,13 +1604,14 @@ def upsert_snapshots_batch(mattermost_user_id, events):
                 ev.get("status") or "",
                 ev.get("summary") or "",
                 (ev.get("organizer_email") or "") if isinstance(ev.get("organizer_email"), str) else "",
+                json.dumps(ev.get("alarms") or []),
                 now_iso,
             )
         )
     sql = (
         """
-        INSERT INTO event_snapshots (mattermost_user_id, uid, start, end, status, summary, organizer_email, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO event_snapshots (mattermost_user_id, uid, start, end, status, summary, organizer_email, alarms, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(mattermost_user_id, uid)
         DO UPDATE SET
             start = excluded.start,
@@ -1476,6 +1619,7 @@ def upsert_snapshots_batch(mattermost_user_id, events):
             status = excluded.status,
             summary = excluded.summary,
             organizer_email = excluded.organizer_email,
+            alarms = excluded.alarms,
             updated_at = excluded.updated_at
         """
     )
@@ -2001,6 +2145,62 @@ def job_daily_summary():
         except Exception:
             continue
 
+
+def job_send_reminders():
+    """Check stored snapshots for alarms that should fire and send reminders.
+    This job is idempotent: sent reminders are recorded in `reminder_history`.
+    """
+    try:
+        now_utc = datetime.now(timezone.utc)
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT mattermost_user_id, uid, summary, start, alarms FROM event_snapshots"
+            )
+            rows = c.fetchall()
+        for mm_user_id, uid, summary, start_iso, alarms_json in rows:
+            if not alarms_json:
+                continue
+            try:
+                alarms = json.loads(alarms_json)
+            except Exception:
+                continue
+            for alarm_iso in alarms:
+                try:
+                    alarm_dt = datetime.fromisoformat(alarm_iso)
+                except Exception:
+                    continue
+                # normalize to UTC for comparison
+                if alarm_dt.tzinfo is None:
+                    alarm_dt = alarm_dt.replace(tzinfo=timezone.utc)
+                alarm_dt_utc = alarm_dt.astimezone(timezone.utc)
+                # Send reminders that are due now or slightly in the past (catch-up window)
+                if alarm_dt_utc <= now_utc and alarm_dt_utc > (now_utc - timedelta(minutes=60)):
+                    # check if already sent
+                    with db_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT 1 FROM reminder_history WHERE mattermost_user_id = ? AND uid = ? AND alarm_time = ?",
+                            (mm_user_id, uid, alarm_iso),
+                        )
+                        if cur.fetchone():
+                            continue
+                        # send reminder
+                        try:
+                            when_text = start_iso
+                            text = f"⏰ Напоминание: встреча '{summary}' запланирована на {when_text}"
+                            mm_send_dm(mm_user_id, text)
+                        except Exception:
+                            # don't insert history if sending failed
+                            continue
+                        cur.execute(
+                            "INSERT OR IGNORE INTO reminder_history (mattermost_user_id, uid, alarm_time, sent_at) VALUES (?, ?, ?, ?)",
+                            (mm_user_id, uid, alarm_iso, datetime.now(timezone.utc).isoformat()),
+                        )
+                        conn.commit()
+    except Exception:
+        logger.exception("Error in job_send_reminders")
+
 @app.route("/mattermost/actions", methods=["POST"])
 def mattermost_actions():
     payload = request.json
@@ -2087,6 +2287,8 @@ def main():
     sync_interval = int(os.getenv("SYNC_INTERVAL_MINUTES", "1"))
     scheduler.add_job(job_events_sync, "interval", minutes=sync_interval)
     scheduler.add_job(cleanup_old_snapshots, "cron", hour=0, minute=0)
+    # reminders job: check alarms every minute
+    scheduler.add_job(job_send_reminders, "interval", minutes=1)
     scheduler.start()
     use_ws_process = os.getenv("USE_WS_PROCESS", "0") in ("1", "true", "True")
     if use_ws_process:
