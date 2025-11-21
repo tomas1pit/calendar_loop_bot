@@ -188,6 +188,39 @@ def init_db():
             pass
         conn.commit()
 
+        # Simple migrations for older DBs: add columns that may be missing
+        try:
+            def _has_column(conn_obj, table, colname):
+                cur = conn_obj.cursor()
+                cur.execute(f"PRAGMA table_info({table})")
+                rows = cur.fetchall()
+                return any(r[1] == colname for r in rows)
+
+            # meeting_drafts: ensure `location` and `duration_min` exist
+            try:
+                if not _has_column(conn, "meeting_drafts", "location"):
+                    conn.execute("ALTER TABLE meeting_drafts ADD COLUMN location TEXT")
+                if not _has_column(conn, "meeting_drafts", "duration_min"):
+                    conn.execute("ALTER TABLE meeting_drafts ADD COLUMN duration_min INTEGER")
+            except Exception:
+                # best-effort: ignore migration failures (will surface later)
+                pass
+
+            # event_snapshots: (keep placeholder for future migration needs)
+            try:
+                if not _has_column(conn, "event_snapshots", "organizer_email"):
+                    conn.execute("ALTER TABLE event_snapshots ADD COLUMN organizer_email TEXT")
+            except Exception:
+                pass
+
+            conn.commit()
+        except Exception:
+            # swallow any unexpected errors during migration to avoid stopping startup
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
 def is_email_allowed(email: str) -> bool:
     if not email:
         return False
