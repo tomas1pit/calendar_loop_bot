@@ -8,3 +8,4 @@ vobject
 cryptography
 pytest
 responses
+sqlite3

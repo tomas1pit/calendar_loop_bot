@@ -91,6 +91,9 @@ CALDAV_PRINCIPAL_PATH = os.getenv("CALDAV_PRINCIPAL_PATH", "/principals/")
 CALDAV_CLIENT_TTL = int(os.getenv("CALDAV_CLIENT_TTL_SECONDS", "300"))
 _caldav_client_cache = {}
 
+# Enable debug logging of raw VEVENTs when alarm parsing fails
+CALDAV_PARSER_DEBUG = os.getenv("CALDAV_PARSER_DEBUG", "0") in ("1", "true", "True")
+
 # Websocket health flag
 WEBSOCKET_CONNECTED = False
 
@@ -988,20 +991,32 @@ def get_events_for_tracking(email, password):
         organizer_email = extract_organizer_email(vevent)
         if status == "CANCELLED":
             continue
-        result.append(
-            {
-                "uid": uid,
-                "summary": summary.value if summary else "(без названия)",
-                "description": desc_val,
-                "start": dtstart,
-                "end": dtend,
-                "url": url,
-                "attendees": attendees,
-                "status": status,
-                "organizer_email": organizer_email,
-                "alarms": extract_alarms_from_vevent(vevent, dtstart),
-            }
-        )
+        alarms = extract_alarms_from_vevent(vevent, dtstart)
+        ev_dict = {
+            "uid": uid,
+            "summary": summary.value if summary else "(без названия)",
+            "description": desc_val,
+            "start": dtstart,
+            "end": dtend,
+            "url": url,
+            "attendees": attendees,
+            "status": status,
+            "organizer_email": organizer_email,
+            "alarms": alarms,
+        }
+        # Debug: if parser didn't find alarms, optionally log raw VEVENT to help diagnose
+        if CALDAV_PARSER_DEBUG and (not alarms):
+            try:
+                raw = getattr(event, "data", None) or getattr(event, "raw", None) or ""
+                if not raw and hasattr(event, "vobject_instance"):
+                    try:
+                        raw = event.vobject_instance.serialize()
+                    except Exception:
+                        raw = "<could not serialize vobject_instance>"
+                logger.debug("CALDAV PARSER DEBUG: uid=%s user=%s raw_vevent=%s", uid, email, (raw or "")[:1000])
+            except Exception:
+                pass
+        result.append(ev_dict)
     result.sort(key=lambda e: e["start"])
     return result
 
@@ -1064,18 +1079,29 @@ def get_today_events(email, password, only_future=False):
                 continue
             if not dtend and dtstart < now_local:
                 continue
-        result.append(
-            {
-                "uid": uid,
-                "summary": summary.value if summary else "(без названия)",
-                "description": desc_val,
-                "start": dtstart,
-                "end": dtend,
-                "url": url,
-                "attendees": attendees,
-                "alarms": extract_alarms_from_vevent(vevent, dtstart),
-            }
-        )
+        alarms = extract_alarms_from_vevent(vevent, dtstart)
+        ev_dict = {
+            "uid": uid,
+            "summary": summary.value if summary else "(без названия)",
+            "description": desc_val,
+            "start": dtstart,
+            "end": dtend,
+            "url": url,
+            "attendees": attendees,
+            "alarms": alarms,
+        }
+        if CALDAV_PARSER_DEBUG and (not alarms):
+            try:
+                raw = getattr(event, "data", None) or getattr(event, "raw", None) or ""
+                if not raw and hasattr(event, "vobject_instance"):
+                    try:
+                        raw = event.vobject_instance.serialize()
+                    except Exception:
+                        raw = "<could not serialize vobject_instance>"
+                logger.debug("CALDAV PARSER DEBUG (tracking): uid=%s user=%s raw_vevent=%s", uid, email, (raw or "")[:1000])
+            except Exception:
+                pass
+        result.append(ev_dict)
     result.sort(key=lambda e: e["start"])
     return result
 
