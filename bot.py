@@ -16,10 +16,13 @@ logger = logging.getLogger(__name__)
 
 import vobject
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from dateutil import tz
 from websocket import create_connection, WebSocketConnectionClosedException
+from multiprocessing import Process
 
 try:
     import caldav
@@ -84,6 +87,12 @@ app = Flask(__name__)
 scheduler = BackgroundScheduler(timezone=TZ_NAME)
 
 CALDAV_PRINCIPAL_PATH = os.getenv("CALDAV_PRINCIPAL_PATH", "/principals/")
+# CalDAV client cache: email -> (client, principal, created_at)
+CALDAV_CLIENT_TTL = int(os.getenv("CALDAV_CLIENT_TTL_SECONDS", "300"))
+_caldav_client_cache = {}
+
+# Websocket health flag
+WEBSOCKET_CONNECTED = False
 
 WELCOME_TEXT_TEMPLATE = """Привет! Для начала надо авторизоваться в твоём календаре.
 
@@ -106,6 +115,13 @@ def build_principal_path_from_email(email: str) -> str:
 
 def init_db():
     with db_conn() as conn:
+        # Performance-friendly pragmas for SQLite
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store = MEMORY;")
+        except Exception:
+            pass
         c = conn.cursor()
         c.execute(
             """
@@ -163,6 +179,13 @@ def init_db():
             )
             """
         )
+        # Indexes to speed up common queries
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_users_state ON users(state)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_event_snapshots_start ON event_snapshots(start)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_meeting_drafts_user ON meeting_drafts(mattermost_user_id)")
+        except Exception:
+            pass
         conn.commit()
 
 def is_email_allowed(email: str) -> bool:
@@ -409,21 +432,29 @@ def mm_headers():
         "Content-Type": "application/json",
     }
 
+# Persistent HTTP session with retries to reuse connections and handle transient errors
+SESSION = requests.Session()
+_retries = Retry(total=3, backoff_factor=0.3, status_forcelist=(500, 502, 503, 504))
+_adapter = HTTPAdapter(max_retries=_retries)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+DEFAULT_TIMEOUT = (3, 10)
+
 def mm_get(path):
     url = MATTERMOST_BASE_URL.rstrip("/") + path
-    resp = requests.get(url, headers=mm_headers())
+    resp = SESSION.get(url, headers=mm_headers(), timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 def mm_post(path, data):
     url = MATTERMOST_BASE_URL.rstrip("/") + path
-    resp = requests.post(url, headers=mm_headers(), json=data)
+    resp = SESSION.post(url, headers=mm_headers(), json=data, timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 def mm_put(path, data):
     url = MATTERMOST_BASE_URL.rstrip("/") + path
-    resp = requests.put(url, headers=mm_headers(), json=data)
+    resp = SESSION.put(url, headers=mm_headers(), json=data, timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -673,11 +704,36 @@ def send_main_menu(user_id):
 def get_caldav_client(email, password):
     if caldav is None:
         raise RuntimeError("Модуль caldav не установлен")
+    # Try to reuse cached client for this email
+    now_ts = time.time()
+    cache_entry = _caldav_client_cache.get(email)
+    if cache_entry:
+        client, principal, created_at = cache_entry
+        if (now_ts - created_at) < CALDAV_CLIENT_TTL:
+            return client, principal
+        else:
+            # expired
+            try:
+                # attempt graceful close if available
+                if hasattr(client, "session"):
+                    try:
+                        client.session.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            del _caldav_client_cache[email]
+
     base_url = CALDAV_BASE_URL.rstrip("/")
     principal_path = build_principal_path_from_email(email)
     principal_url = base_url + principal_path
     client = caldav.DAVClient(url=base_url, username=email, password=password)
     principal = caldav.Principal(client=client, url=principal_url)
+    # store in cache
+    try:
+        _caldav_client_cache[email] = (client, principal, now_ts)
+    except Exception:
+        pass
     return client, principal
 
 def get_primary_calendar(email, password):
@@ -1353,6 +1409,48 @@ def upsert_snapshot(mattermost_user_id, ev):
         )
         conn.commit()
 
+
+def upsert_snapshots_batch(mattermost_user_id, events):
+    """Batch upsert multiple event snapshots for a user."""
+    if not events:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for ev in events:
+        start_str = ev["start"].isoformat() if isinstance(ev["start"], datetime) else str(ev["start"])
+        end_val = ev.get("end")
+        end_str = end_val.isoformat() if isinstance(end_val, datetime) else (end_val or "")
+        rows.append(
+            (
+                mattermost_user_id,
+                ev["uid"],
+                start_str,
+                end_str,
+                ev.get("status") or "",
+                ev.get("summary") or "",
+                (ev.get("organizer_email") or "") if isinstance(ev.get("organizer_email"), str) else "",
+                now_iso,
+            )
+        )
+    sql = (
+        """
+        INSERT INTO event_snapshots (mattermost_user_id, uid, start, end, status, summary, organizer_email, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(mattermost_user_id, uid)
+        DO UPDATE SET
+            start = excluded.start,
+            end = excluded.end,
+            status = excluded.status,
+            summary = excluded.summary,
+            organizer_email = excluded.organizer_email,
+            updated_at = excluded.updated_at
+        """
+    )
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.executemany(sql, rows)
+        conn.commit()
+
 def delete_snapshot(mattermost_user_id, uid):
     with db_conn() as conn:
         c = conn.cursor()
@@ -1438,17 +1536,20 @@ def job_events_sync():
         first_sync = len(old_map) == 0
         new_map = {ev["uid"]: ev for ev in new_events}
         if first_sync:
-            for ev in new_events:
-                upsert_snapshot(mm_user_id, ev)
+            # First sync: batch insert all snapshots
+            upsert_snapshots_batch(mm_user_id, new_events)
             continue
+
+        to_upsert = []
         for uid, ev in new_map.items():
             old_ev = old_map.get(uid)
             org = (ev.get("organizer_email") or "").lower()
             is_organizer = org and org == email.lower()
             if not old_ev:
-                upsert_snapshot(mm_user_id, ev)
+                # New event
                 if not is_organizer:
                     send_new_event_notification(mm_user_id, ev)
+                to_upsert.append(ev)
                 continue
             old_start = old_ev["start"]
             old_end = old_ev["end"]
@@ -1456,9 +1557,9 @@ def job_events_sync():
             new_end_val = ev.get("end")
             new_end = new_end_val.isoformat() if isinstance(new_end_val, datetime) else (new_end_val or "")
             moved = (old_start != new_start) or (old_end != new_end)
-            upsert_snapshot(mm_user_id, ev)
             if moved and not is_organizer:
                 send_event_rescheduled_notification(mm_user_id, old_ev, ev)
+            to_upsert.append(ev)
         for uid, old_ev in old_map.items():
             if uid in new_map:
                 continue
@@ -1490,6 +1591,9 @@ def job_events_sync():
             if not is_organizer:
                 send_event_cancelled_notification(mm_user_id, pseudo_ev)
             delete_snapshot(mm_user_id, uid)
+        # Batch update/insert snapshots for this user
+        if to_upsert:
+            upsert_snapshots_batch(mm_user_id, to_upsert)
 
 def handle_meeting_draft_step(user_id, channel_id, user, draft, text):
     step = draft["step"]
@@ -1728,6 +1832,9 @@ def websocket_loop():
     ws_url = ws_url.rstrip("/") + "/api/v4/websocket"
     logger.info("Starting websocket loop to %s", ws_url)
 
+    backoff = 1.0
+    max_backoff = float(os.getenv("WS_MAX_BACKOFF_SECONDS", "30"))
+    global WEBSOCKET_CONNECTED
     while True:
         try:
             logger.info("Connecting to Mattermost websocket...")
@@ -1736,6 +1843,8 @@ def websocket_loop():
                 header=[f"Authorization: Bearer {MATTERMOST_BOT_TOKEN}"],
             )
             logger.info("Websocket connected")
+            WEBSOCKET_CONNECTED = True
+            backoff = 1.0
 
             while True:
                 try:
@@ -1750,8 +1859,8 @@ def websocket_loop():
                 if not msg:
                     continue
 
-                print(msg)
-                
+                logger.debug("WS raw: %s", msg)
+
                 try:
                     data = json.loads(msg)
                 except Exception as e:
@@ -1831,12 +1940,16 @@ def websocket_loop():
                     logger.exception("Error in handle_new_dm_message: %s", e)
 
         except WebSocketConnectionClosedException:
-            logger.warning("Websocket connection closed, reconnecting in 3 seconds...")
-            time.sleep(3)
+            logger.warning("Websocket connection closed, will reconnect with backoff")
+            WEBSOCKET_CONNECTED = False
+            time.sleep(min(backoff, max_backoff))
+            backoff = min(backoff * 2, max_backoff)
             continue
         except Exception as e:
             logger.exception("Unexpected error in websocket_loop: %s", e)
-            time.sleep(5)
+            WEBSOCKET_CONNECTED = False
+            time.sleep(min(backoff, max_backoff))
+            backoff = min(backoff * 2, max_backoff)
             continue
 
 def job_daily_summary():
@@ -1937,11 +2050,18 @@ def main():
     init_bot_identity()
     logger.info("Bot started with BOT_USER_ID=%s BOT_USERNAME=%s", BOT_USER_ID, BOT_USERNAME)
     scheduler.add_job(job_daily_summary, "cron", hour=14, minute=0)
-    scheduler.add_job(job_events_sync, "interval", minutes=1)  # TO_BE_UPDATED
+    # Keep sync interval low for debugging by default; configurable via SYNC_INTERVAL_MINUTES
+    sync_interval = int(os.getenv("SYNC_INTERVAL_MINUTES", "1"))
+    scheduler.add_job(job_events_sync, "interval", minutes=sync_interval)
     scheduler.add_job(cleanup_old_snapshots, "cron", hour=0, minute=0)
     scheduler.start()
-    t = threading.Thread(target=websocket_loop, daemon=True)
-    t.start()
+    use_ws_process = os.getenv("USE_WS_PROCESS", "0") in ("1", "true", "True")
+    if use_ws_process:
+        p = Process(target=websocket_loop, daemon=True)
+        p.start()
+    else:
+        t = threading.Thread(target=websocket_loop, daemon=True)
+        t.start()
     port = int(os.getenv("PORT", "8000"))
     logger.info("Starting Flask app on port %s", port)
     app.run(host="0.0.0.0", port=port)
