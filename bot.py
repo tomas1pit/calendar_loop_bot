@@ -1701,23 +1701,40 @@ def job_events_sync():
     tz_local = tz.gettz(TZ_NAME)
     now_local = datetime.now(tz_local)
     users = get_all_ready_users()
+    logger.debug("job_events_sync: running for %d users", len(users))
+
+    total_new = 0
+    total_moved = 0
+    total_cancelled = 0
+    total_upserted = 0
+
     for user in users:
         mm_user_id = user["mattermost_user_id"]
         email = user["email"]
         pwd = user["caldav_password"]
         try:
             new_events = get_events_for_tracking(email, pwd)
-        except Exception:
+        except Exception as e:
+            logger.debug("job_events_sync: failed to fetch events for %s: %s", mm_user_id, e)
             continue
         old_map = load_snapshots_for_user(mm_user_id)
         first_sync = len(old_map) == 0
         new_map = {ev["uid"]: ev for ev in new_events}
+        logger.debug(
+            "job_events_sync: user=%s old=%d new=%d",
+            mm_user_id,
+            len(old_map),
+            len(new_events),
+        )
         if first_sync:
             # First sync: batch insert all snapshots
             upsert_snapshots_batch(mm_user_id, new_events)
+            total_upserted += len(new_events)
             continue
 
         to_upsert = []
+        new_count = 0
+        moved_count = 0
         for uid, ev in new_map.items():
             old_ev = old_map.get(uid)
             org = (ev.get("organizer_email") or "").lower()
@@ -1725,8 +1742,13 @@ def job_events_sync():
             if not old_ev:
                 # New event
                 if not is_organizer:
-                    send_new_event_notification(mm_user_id, ev)
+                    try:
+                        logger.info("job_events_sync: sending new event notification to %s uid=%s", mm_user_id, uid)
+                        send_new_event_notification(mm_user_id, ev)
+                    except Exception:
+                        logger.exception("Failed to send new event notification for %s uid=%s", mm_user_id, uid)
                 to_upsert.append(ev)
+                new_count += 1
                 continue
             old_start = old_ev["start"]
             old_end = old_ev["end"]
@@ -1735,8 +1757,15 @@ def job_events_sync():
             new_end = new_end_val.isoformat() if isinstance(new_end_val, datetime) else (new_end_val or "")
             moved = (old_start != new_start) or (old_end != new_end)
             if moved and not is_organizer:
-                send_event_rescheduled_notification(mm_user_id, old_ev, ev)
+                try:
+                    logger.info("job_events_sync: sending moved notification to %s uid=%s", mm_user_id, uid)
+                    send_event_rescheduled_notification(mm_user_id, old_ev, ev)
+                except Exception:
+                    logger.exception("Failed to send moved notification for %s uid=%s", mm_user_id, uid)
+                moved_count += 1
             to_upsert.append(ev)
+        # Check for deleted events
+        cancelled_count = 0
         for uid, old_ev in old_map.items():
             if uid in new_map:
                 continue
@@ -1766,11 +1795,30 @@ def job_events_sync():
                 "end": end_old,
             }
             if not is_organizer:
-                send_event_cancelled_notification(mm_user_id, pseudo_ev)
+                try:
+                    logger.info("job_events_sync: sending cancelled notification to %s uid=%s", mm_user_id, uid)
+                    send_event_cancelled_notification(mm_user_id, pseudo_ev)
+                except Exception:
+                    logger.exception("Failed to send cancelled notification for %s uid=%s", mm_user_id, uid)
+                cancelled_count += 1
             delete_snapshot(mm_user_id, uid)
+
         # Batch update/insert snapshots for this user
         if to_upsert:
             upsert_snapshots_batch(mm_user_id, to_upsert)
+            total_upserted += len(to_upsert)
+
+        total_new += new_count
+        total_moved += moved_count
+        total_cancelled += cancelled_count
+
+    logger.info(
+        "job_events_sync: total_new=%d total_moved=%d total_cancelled=%d total_upserted=%d",
+        total_new,
+        total_moved,
+        total_cancelled,
+        total_upserted,
+    )
 
 def handle_meeting_draft_step(user_id, channel_id, user, draft, text):
     step = draft["step"]
@@ -2165,41 +2213,76 @@ def job_send_reminders():
                 alarms = json.loads(alarms_json)
             except Exception:
                 continue
-            for alarm_iso in alarms:
-                try:
-                    alarm_dt = datetime.fromisoformat(alarm_iso)
-                except Exception:
-                    continue
-                # normalize to UTC for comparison
-                if alarm_dt.tzinfo is None:
-                    alarm_dt = alarm_dt.replace(tzinfo=timezone.utc)
-                alarm_dt_utc = alarm_dt.astimezone(timezone.utc)
-                # Send reminders that are due now or slightly in the past (catch-up window)
-                if alarm_dt_utc <= now_utc and alarm_dt_utc > (now_utc - timedelta(minutes=60)):
-                    # check if already sent
-                    with db_conn() as conn:
-                        cur = conn.cursor()
-                        cur.execute(
-                            "SELECT 1 FROM reminder_history WHERE mattermost_user_id = ? AND uid = ? AND alarm_time = ?",
-                            (mm_user_id, uid, alarm_iso),
-                        )
-                        if cur.fetchone():
-                            continue
-                        # send reminder
+            try:
+                now_utc = datetime.now(timezone.utc)
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    c.execute(
+                        "SELECT mattermost_user_id, uid, summary, start, alarms FROM event_snapshots"
+                    )
+                    rows = c.fetchall()
+                logger.debug("job_send_reminders: fetched %d rows from event_snapshots", len(rows))
+                checks = 0
+                sent = 0
+                skipped_already = 0
+                skipped_not_due = 0
+                for mm_user_id, uid, summary, start_iso, alarms_json in rows:
+                    if not alarms_json:
+                        continue
+                    try:
+                        alarms = json.loads(alarms_json)
+                    except Exception:
+                        logger.debug("job_send_reminders: invalid alarms JSON for uid=%s user=%s", uid, mm_user_id)
+                        continue
+                    for alarm_iso in alarms:
+                        checks += 1
                         try:
-                            when_text = start_iso
-                            text = f"⏰ Напоминание: встреча '{summary}' запланирована на {when_text}"
-                            mm_send_dm(mm_user_id, text)
+                            alarm_dt = datetime.fromisoformat(alarm_iso)
                         except Exception:
-                            # don't insert history if sending failed
+                            logger.debug("job_send_reminders: cannot parse alarm ISO %r for uid=%s", alarm_iso, uid)
                             continue
-                        cur.execute(
-                            "INSERT OR IGNORE INTO reminder_history (mattermost_user_id, uid, alarm_time, sent_at) VALUES (?, ?, ?, ?)",
-                            (mm_user_id, uid, alarm_iso, datetime.now(timezone.utc).isoformat()),
-                        )
-                        conn.commit()
+                        # normalize to UTC for comparison
+                        if alarm_dt.tzinfo is None:
+                            alarm_dt = alarm_dt.replace(tzinfo=timezone.utc)
+                        alarm_dt_utc = alarm_dt.astimezone(timezone.utc)
+                        # Send reminders that are due now or slightly in the past (catch-up window)
+                        if not (alarm_dt_utc <= now_utc and alarm_dt_utc > (now_utc - timedelta(minutes=60))):
+                            skipped_not_due += 1
+                            logger.debug("job_send_reminders: alarm %s for uid=%s not due (now=%s)", alarm_iso, uid, now_utc.isoformat())
+                            continue
+                        # check if already sent
+                        with db_conn() as conn:
+                            cur = conn.cursor()
+                            cur.execute(
+                                "SELECT 1 FROM reminder_history WHERE mattermost_user_id = ? AND uid = ? AND alarm_time = ?",
+                                (mm_user_id, uid, alarm_iso),
+                            )
+                            if cur.fetchone():
+                                skipped_already += 1
+                                logger.debug("job_send_reminders: alarm %s for uid=%s already sent", alarm_iso, uid)
+                                continue
+                            # send reminder
+                            try:
+                                when_text = start_iso
+                                text = f"⏰ Напоминание: встреча '{summary}' запланирована на {when_text}"
+                                logger.info("job_send_reminders: sending reminder to %s for uid=%s alarm=%s", mm_user_id, uid, alarm_iso)
+                                mm_send_dm(mm_user_id, text)
+                                sent += 1
+                            except Exception:
+                                logger.exception("job_send_reminders: failed to send reminder to %s for uid=%s", (mm_user_id, uid))
+                                # don't insert history if sending failed
+                                continue
+                            cur.execute(
+                                "INSERT OR IGNORE INTO reminder_history (mattermost_user_id, uid, alarm_time, sent_at) VALUES (?, ?, ?, ?)",
+                                (mm_user_id, uid, alarm_iso, datetime.now(timezone.utc).isoformat()),
+                            )
+                            conn.commit()
+                logger.info("job_send_reminders: checks=%d sent=%d skipped_already=%d skipped_not_due=%d", checks, sent, skipped_already, skipped_not_due)
+            except Exception:
+                logger.exception("Error in job_send_reminders")
     except Exception:
-        logger.exception("Error in job_send_reminders")
+        logger.exception("Error in job_send_reminders (outer)")
+
 
 @app.route("/mattermost/actions", methods=["POST"])
 def mattermost_actions():
@@ -2282,13 +2365,26 @@ def main():
     check_encryption_misconfiguration()
     init_bot_identity()
     logger.info("Bot started with BOT_USER_ID=%s BOT_USERNAME=%s", BOT_USER_ID, BOT_USERNAME)
-    scheduler.add_job(job_daily_summary, "cron", hour=14, minute=0)
+    # Schedule jobs to run on exact 0 seconds of the minute
+    scheduler.add_job(job_daily_summary, "cron", hour=14, minute=0, second=0)
     # Keep sync interval low for debugging by default; configurable via SYNC_INTERVAL_MINUTES
     sync_interval = int(os.getenv("SYNC_INTERVAL_MINUTES", "1"))
-    scheduler.add_job(job_events_sync, "interval", minutes=sync_interval)
-    scheduler.add_job(cleanup_old_snapshots, "cron", hour=0, minute=0)
-    # reminders job: check alarms every minute
-    scheduler.add_job(job_send_reminders, "interval", minutes=1)
+
+    def _align_next_run(minutes: int):
+        tz_local = tz.gettz(TZ_NAME)
+        now = datetime.now(tz_local)
+        base = now.replace(second=0, microsecond=0)
+        return base + timedelta(minutes=minutes)
+
+    scheduler.add_job(
+        job_events_sync,
+        "interval",
+        minutes=sync_interval,
+        next_run_time=_align_next_run(sync_interval),
+    )
+    scheduler.add_job(cleanup_old_snapshots, "cron", hour=0, minute=0, second=0)
+    # reminders job: check alarms every minute, aligned to 0 seconds
+    scheduler.add_job(job_send_reminders, "interval", minutes=1, next_run_time=_align_next_run(1))
     scheduler.start()
     use_ws_process = os.getenv("USE_WS_PROCESS", "0") in ("1", "true", "True")
     if use_ws_process:
