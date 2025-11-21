@@ -1750,6 +1750,8 @@ def websocket_loop():
                 if not msg:
                     continue
 
+                print(msg)
+                
                 try:
                     data = json.loads(msg)
                 except Exception as e:
