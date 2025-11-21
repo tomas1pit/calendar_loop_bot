@@ -2066,3 +2066,7 @@ def main():
     logger.info("Starting Flask app on port %s", port)
     app.run(host="0.0.0.0", port=port)
 
+
+if __name__ == "__main__":
+    main()
+
